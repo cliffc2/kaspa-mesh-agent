@@ -1,82 +1,119 @@
 # -------------------------------------------------
 # kaspa_wallet.py
-# Wallet helpers using the official Kaspa Python SDK
-# Provides encrypted on-disk storage and sign utilities
+# Wrapper around kaswallet-cli (IgraLabs)
+# Uses subprocess to interact with the gRPC wallet daemon
 # -------------------------------------------------
-import json, hashlib, os
-from typing import Optional
+import subprocess
+import json
+from typing import Optional, Dict, Any, Union
+from pathlib import Path
 
-from Cryptodome.Cipher import AES
-from Cryptodome.Random import get_random_bytes
-from kaspa import (
-    Mnemonic,
-    XPrv,
-    Keypair,
-    NetworkType,
-    create_transaction,
-    sign_transaction,
-)
+DEFAULT_NETWORK = "testnet"
 
 
-def _derive_key(pw: str) -> bytes:
-    return hashlib.sha256(pw.encode()).digest()
+class KaswalletError(Exception):
+    """Raised when kaswallet-cli fails."""
+
+    pass
 
 
-def save_wallet(mnemonic_phrase: str, path: str, password: str) -> None:
-    """Persist only the mnemonic (never raw private keys)."""
-    data = {"mnemonic": mnemonic_phrase}
-    plain = json.dumps(data).encode()
-    key = _derive_key(password)
-    nonce = get_random_bytes(12)
-    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-    ct, tag = cipher.encrypt_and_digest(plain)
-    with open(path, "wb") as f:
-        f.write(nonce)
-        f.write(tag)
-        f.write(ct)
+def _run_cli(args: list, network: str = DEFAULT_NETWORK, timeout: int = 30) -> str:
+    """Run kaswallet-cli command and return stdout."""
+    cmd = ["kaswallet-cli", f"--{network}"] + args
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=True,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        raise KaswalletError(f"kaswallet-cli failed: {e.stderr}") from e
+    except FileNotFoundError:
+        raise KaswalletError(
+            "kaswallet-cli not found. Install from https://github.com/IgraLabs/kaswallet"
+        ) from None
 
 
-def load_wallet(path: str, password: str) -> Mnemonic:
-    """Decrypt the file and return a Mnemonic object."""
-    with open(path, "rb") as f:
-        nonce = f.read(12)
-        tag = f.read(16)
-        ct = f.read()
-    key = _derive_key(password)
-    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-    plain = cipher.decrypt_and_verify(ct, tag)
-    data = json.loads(plain.decode())
-    return Mnemonic(data["mnemonic"])
+def get_balance(network: str = DEFAULT_NETWORK) -> Dict[str, Any]:
+    """Get wallet balance."""
+    output = _run_cli(["balance", "--json"], network)
+    return json.loads(output)
 
 
-def get_keypair(
-    mnemonic: Mnemonic, derivation_path: str = "m/44/111111/0/0/0"
-) -> Keypair:
-    """Derive a Keypair from a mnemonic."""
-    seed = mnemonic.to_seed("")
-    xprv = XPrv(seed)
-    child = xprv.derive_path(derivation_path)
-    return Keypair.from_private_key(child.to_private_key())
+def get_addresses(network: str = DEFAULT_NETWORK) -> list:
+    """Show all wallet addresses."""
+    output = _run_cli(["show-addresses", "--json"], network)
+    return json.loads(output)
 
 
-def get_address(mnemonic: Mnemonic, network: NetworkType = NetworkType.Mainnet) -> str:
-    """Get the Kaspa address from a mnemonic."""
-    kp = get_keypair(mnemonic)
-    addr = kp.to_address(network)
-    return str(addr)
+def new_address(network: str = DEFAULT_NETWORK) -> str:
+    """Generate a new address."""
+    output = _run_cli(["new-address", "--json"], network)
+    return json.loads(output).get("address", "")
 
 
-def create_unsigned_tx(utxo_source, outputs: list, priority_fee: int = 1000):
-    """Create an unsigned transaction using the kaspa SDK."""
-    return create_transaction(utxo_source, outputs, priority_fee)
+def create_unsigned_tx(
+    to_address: str,
+    amount_sompi: int,
+    fee_sompi: int = 1000,
+    network: str = DEFAULT_NETWORK,
+) -> Dict[str, Any]:
+    """Create an unsigned transaction."""
+    output = _run_cli(
+        [
+            "create-unsigned-transaction",
+            "--to",
+            to_address,
+            "--amount",
+            str(amount_sompi),
+            "--fee",
+            str(fee_sompi),
+            "--json",
+        ],
+        network,
+    )
+    return json.loads(output)
 
 
-def sign_tx(tx, mnemonic: Mnemonic, verify_sig: bool = True):
-    """Sign a transaction with the wallet derived from mnemonic."""
-    kp = get_keypair(mnemonic)
-    return sign_transaction(tx, kp, verify_sig)
+def sign_tx(tx_input: str, network: str = DEFAULT_NETWORK) -> Dict[str, Any]:
+    """Sign an unsigned transaction. tx_input can be a file path or transaction ID."""
+    output = _run_cli(["sign", "--input", tx_input, "--json"], network)
+    return json.loads(output)
 
 
-def verify_raw_tx(raw_tx) -> bool:
-    """Quick sanity-check - verifies the transaction is valid."""
-    return raw_tx is not None
+def broadcast_tx(tx_input: str, network: str = DEFAULT_NETWORK) -> Dict[str, Any]:
+    """Broadcast a signed transaction."""
+    output = _run_cli(["broadcast", "--input", tx_input, "--json"], network)
+    return json.loads(output)
+
+
+def send(
+    to_address: str,
+    amount_sompi: int,
+    fee_sompi: int = 1000,
+    network: str = DEFAULT_NETWORK,
+) -> Dict[str, Any]:
+    """Send transaction directly (create + sign + broadcast in one step)."""
+    output = _run_cli(
+        [
+            "send",
+            "--to",
+            to_address,
+            "--amount",
+            str(amount_sompi),
+            "--fee",
+            str(fee_sompi),
+            "--json",
+        ],
+        network,
+    )
+    return json.loads(output)
+
+
+def get_daemon_version(network: str = DEFAULT_NETWORK) -> str:
+    """Get the wallet daemon version."""
+    output = _run_cli(["get-daemon-version"], network)
+    return output

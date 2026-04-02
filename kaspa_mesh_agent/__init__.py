@@ -3,22 +3,26 @@
 # -------------------------------------------------
 from .kaspa_mesh_agent_lr2021 import KaspaMeshAgent
 from .kaspa_wallet import (
-    load_wallet,
-    save_wallet,
-    get_keypair,
-    get_address,
+    get_balance,
+    get_addresses,
+    new_address,
     create_unsigned_tx,
     sign_tx,
-    verify_raw_tx,
+    broadcast_tx,
+    send,
+    get_daemon_version,
+    KaswalletError,
 )
 
 __all__ = [
     "KaspaMeshAgent",
-    "load_wallet",
-    "save_wallet",
-    "get_keypair",
-    "get_address",
+    "get_balance",
+    "get_addresses",
+    "new_address",
     "create_unsigned_tx",
     "sign_tx",
-    "verify_raw_tx",
+    "broadcast_tx",
+    "send",
+    "get_daemon_version",
+    "KaswalletError",
 ]

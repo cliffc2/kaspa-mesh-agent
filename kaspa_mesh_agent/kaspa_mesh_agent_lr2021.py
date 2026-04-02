@@ -24,10 +24,10 @@ nltk.download("punkt", quiet=True)
 # Local imports
 from .mesh_listener import MeshListener
 from .kaspa_wallet import (
-    load_wallet,
-    create_unsigned_tx,
-    sign_tx,
-    verify_raw_tx,
+    create_unsigned_tx as _cli_create_unsigned_tx,
+    sign_tx as _cli_sign_tx,
+    broadcast_tx as _cli_broadcast_tx,
+    KaswalletError,
 )
 
 DEFAULT_CHUNK_FLRC = 1200
@@ -45,11 +45,13 @@ class KaspaMeshAgent:
         node_type: str = "general",
         openrouter_key: Optional[str] = None,
         use_flrc: bool = True,
+        network: str = "testnet",
     ):
         self.node_type = node_type
         self.node_id = hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]
         self.openrouter_key = openrouter_key or os.getenv("OPENROUTER_API_KEY")
         self.use_flrc = use_flrc
+        self.network = network
         self.interface: Optional[SerialInterface] = None
         self.rpc_client: Optional[RpcClient] = None
         self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -64,7 +66,7 @@ class KaspaMeshAgent:
         self._listener: Optional[MeshListener] = None
 
         print(
-            f"[KaspaMeshAgent {self.node_id}] init - type={self.node_type} | FLRC={self.use_flrc}"
+            f"[KaspaMeshAgent {self.node_id}] init - type={self.node_type} | FLRC={self.use_flrc} | network={self.network}"
         )
 
     def load(self, force: bool = False) -> Dict:
@@ -86,6 +88,7 @@ class KaspaMeshAgent:
             "node_id": self.node_id,
             "type": self.node_type,
             "flrc": self.use_flrc,
+            "network": self.network,
         }
 
     def _build_kaspa_rag(self):
@@ -149,31 +152,34 @@ class KaspaMeshAgent:
     async def create_unsigned_tx(
         self, to_address: str, amount_sompi: int, fee_sompi: int = 1000
     ) -> Dict:
-        tx = create_unsigned_tx(to_address, amount_sompi, fee_sompi)
-        unsigned_hex = tx.serialized().hex()
-        return {"unsigned_tx_hex": unsigned_hex}
+        """Create unsigned transaction via kaswallet-cli."""
+        return _cli_create_unsigned_tx(
+            to_address, amount_sompi, fee_sompi, self.network
+        )
 
-    async def sign_tx(
-        self, unsigned_hex: str, wallet_path: str, password: str, account_idx: int = 0
-    ) -> str:
-        wallet = load_wallet(wallet_path, password)
-        from kaspa import Transaction
+    async def sign_tx(self, unsigned_tx_input: str) -> Dict:
+        """Sign transaction via kaswallet-cli.
 
-        tx_obj = Transaction.deserialize(bytes.fromhex(unsigned_hex))
-        signed_hex = sign_tx(tx_obj, wallet, account_idx)
-        assert verify_raw_tx(signed_hex), "Signed payload broken!"
-        return signed_hex
+        Args:
+            unsigned_tx_input: Transaction ID or file path of unsigned tx
 
-    async def broadcast_tx(self, signed_tx_hex: str) -> Dict:
-        if not self.rpc_client:
-            return {"error": "No RPC client (node not a gateway)"}
-        try:
-            result = await self.rpc_client.submit_transaction(
-                transaction=signed_tx_hex, allow_orphan=False
-            )
-            return {"txid": result.get("txId"), "status": "broadcasted"}
-        except Exception as e:
-            return {"error": str(e)}
+        Returns:
+            Dict with signed transaction data
+        """
+        return _cli_sign_tx(unsigned_tx_input, self.network)
+
+    async def broadcast_tx(self, signed_tx_input: str) -> Dict:
+        """Broadcast signed transaction via kaswallet-cli or RPC fallback."""
+        if self.rpc_client:
+            try:
+                result = await self.rpc_client.submit_transaction(
+                    transaction=signed_tx_input, allow_orphan=False
+                )
+                return {"txid": result.get("txId"), "status": "broadcasted"}
+            except Exception:
+                pass
+        # Fallback to kaswallet-cli broadcast
+        return _cli_broadcast_tx(signed_tx_input, self.network)
 
     def qa(self, question: str, max_tokens: int = 256) -> str:
         if not self.index:

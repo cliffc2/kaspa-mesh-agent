@@ -1,5 +1,5 @@
-import os, json, asyncio, pytest
-from unittest.mock import MagicMock, patch
+import os, json, pytest
+from unittest.mock import patch, MagicMock
 from kaspa_mesh_agent import KaspaMeshAgent
 
 
@@ -47,3 +47,36 @@ async def test_metadata():
     meta = agent.metadata()
     assert "title" in meta
     assert "Kaspa" in meta["title"]
+
+
+@pytest.mark.asyncio
+async def test_create_unsigned_tx():
+    from kaspa_mesh_agent.kaspa_wallet import create_unsigned_tx
+
+    with patch("kaspa_mesh_agent.kaspa_wallet._run_cli") as mock_cli:
+        mock_cli.return_value = json.dumps({"tx_id": "test123", "unsigned": True})
+        result = await KaspaMeshAgent().create_unsigned_tx("kaspa:qqq...", 1000000)
+        assert mock_cli.called
+
+
+@pytest.mark.asyncio
+async def test_sign_tx():
+    from kaspa_mesh_agent.kaspa_wallet import sign_tx
+
+    with patch("kaspa_mesh_agent.kaspa_wallet._run_cli") as mock_cli:
+        mock_cli.return_value = json.dumps({"tx_id": "test123", "signed": True})
+        result = await KaspaMeshAgent().sign_tx("test123")
+        assert mock_cli.called
+
+
+@pytest.mark.asyncio
+async def test_broadcast_tx():
+    from kaspa_mesh_agent.kaspa_wallet import broadcast_tx
+
+    with patch("kaspa_mesh_agent.kaspa_wallet._run_cli") as mock_cli:
+        mock_cli.return_value = json.dumps(
+            {"tx_id": "test123", "status": "broadcasted"}
+        )
+        agent = KaspaMeshAgent(node_type="gateway")
+        result = await agent.broadcast_tx("signed_tx_123")
+        assert mock_cli.called
