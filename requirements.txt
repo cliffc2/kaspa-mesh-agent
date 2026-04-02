@@ -1,0 +1,9 @@
+meshtastic
+kaspa
+sentence-transformers
+faiss-cpu
+nltk
+requests
+pycryptodomex
+pytest
+pytest-asyncio

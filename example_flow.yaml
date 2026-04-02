@@ -1,0 +1,30 @@
+name: kaspa_swarm
+description: >
+  A self-organising Kaspa mesh swarm that can answer questions,
+  sign off-grid payments and broadcast them via the gateway.
+
+steps:
+  - name: init
+    tool: kaspa_mesh_agent.KaspaMeshAgent.load
+    args: {}
+
+  - name: start_listener
+    tool: kaspa_mesh_agent.KaspaMeshAgent.start_listener
+    args: {}
+
+  - name: answer_question
+    tool: kaspa_mesh_agent.KaspaMeshAgent.qa
+    args:
+      question: "{{ user_question }}"
+
+  - name: payment_mission
+    condition: "{{ 'pay' in user_intent }}"
+    tool: kaspa_mesh_agent.KaspaMeshAgent.create_unsigned_tx
+    args:
+      to_address: "{{ payment_address }}"
+      amount_sompi: "{{ payment_amount }}"
+
+  - name: reply
+    type: reply
+    args:
+      content: "{{ answer_question }}"

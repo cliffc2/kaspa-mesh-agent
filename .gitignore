@@ -1,0 +1,8 @@
+.venv/
+kaspa_mesh_cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+media_received/
+*.bin
+.env
