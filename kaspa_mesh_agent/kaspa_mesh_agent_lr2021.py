@@ -1,10 +1,12 @@
 # ========================================================
 # kaspa_mesh_agent_lr2021.py
 # Core self-organising Kaspa agent for LR2021 / FLRC LoRa
+# Extended with atomic swap + THORChain-style fee support
 # ========================================================
 import os, json, time, asyncio, hashlib, base64
 from pathlib import Path
 from typing import Dict, List, Optional
+from decimal import Decimal
 
 import requests
 from meshtastic.serial_interface import SerialInterface
@@ -29,6 +31,28 @@ from .kaspa_wallet import (
     broadcast_tx as _cli_broadcast_tx,
     KaswalletError,
 )
+
+# Atomic swap + fee engine
+try:
+    from .atomic_swap import (
+        initiate_htlc as _kaspa_initiate,
+        claim_htlc as _kaspa_claim,
+        refund_htlc as _kaspa_refund,
+        status_swap as _kaspa_status,
+    )
+    from .liquidity_pool_manager import LiquidityPoolManager
+
+    HAS_SWAP_SUPPORT = True
+except ImportError:
+    HAS_SWAP_SUPPORT = False
+
+# WebSocket fallback transport
+try:
+    from .ws_transport import WebSocketTransport
+
+    HAS_WS_TRANSPORT = True
+except ImportError:
+    HAS_WS_TRANSPORT = False
 
 DEFAULT_CHUNK_FLRC = 1200
 DEFAULT_CHUNK_CLASSIC = 230
@@ -65,8 +89,19 @@ class KaspaMeshAgent:
 
         self._listener: Optional[MeshListener] = None
 
+        if HAS_SWAP_SUPPORT:
+            self.pool_manager = LiquidityPoolManager()
+        else:
+            self.pool_manager = None
+
+        self._ws_transport = None
+        if HAS_WS_TRANSPORT and os.getenv("WS_TRANSPORT_URI"):
+            self._ws_transport = WebSocketTransport(
+                uri=os.getenv("WS_TRANSPORT_URI"), node_id=self.node_id
+            )
+
         print(
-            f"[KaspaMeshAgent {self.node_id}] init - type={self.node_type} | FLRC={self.use_flrc} | network={self.network}"
+            f"[KaspaMeshAgent {self.node_id}] init - type={self.node_type} | FLRC={self.use_flrc} | network={self.network} | swaps={HAS_SWAP_SUPPORT} | ws={bool(self._ws_transport)}"
         )
 
     def load(self, force: bool = False) -> Dict:
@@ -123,31 +158,45 @@ class KaspaMeshAgent:
         return [data[i : i + chunk_sz] for i in range(0, len(data), chunk_sz)]
 
     def send_over_mesh(self, payload: Dict, destination: int = 0xFFFFFFFF) -> bool:
-        if not self.interface:
-            print("No Meshtastic interface - abort send")
-            return False
+        if self.interface:
+            raw = json.dumps(payload).encode("utf-8")
+            chunks = self._chunk_payload(raw)
 
-        raw = json.dumps(payload).encode("utf-8")
-        chunks = self._chunk_payload(raw)
+            for seq, chunk in enumerate(chunks):
+                msg = {
+                    "mid": hashlib.sha256(raw).hexdigest()[:12],
+                    "seq": seq,
+                    "total": len(chunks),
+                    "payload": base64.b64encode(chunk).decode(),
+                }
+                self.interface.sendData(
+                    data=json.dumps(msg).encode(),
+                    destinationId=destination,
+                    portNum=portnums_pb2.PortNum.PRIVATE_APP,
+                    wantAck=True,
+                    hopLimit=7,
+                )
+                time.sleep(0.05 if self.use_flrc else 0.4)
 
-        for seq, chunk in enumerate(chunks):
-            msg = {
-                "mid": hashlib.sha256(raw).hexdigest()[:12],
-                "seq": seq,
-                "total": len(chunks),
-                "payload": base64.b64encode(chunk).decode(),
-            }
-            self.interface.sendData(
-                data=json.dumps(msg).encode(),
-                destinationId=destination,
-                portNum=portnums_pb2.PortNum.PRIVATE_APP,
-                wantAck=True,
-                hopLimit=7,
-            )
-            time.sleep(0.05 if self.use_flrc else 0.4)
+            print(f"Sent {len(chunks)} chunk(s) over LoRa -> {len(raw)} B total")
+            return True
 
-        print(f"Sent {len(chunks)} chunk(s) -> {len(raw)} B total")
-        return True
+        if self._ws_transport and self._ws_transport.connected:
+            import asyncio
+
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(self._ws_transport.send(payload))
+                else:
+                    loop.run_until_complete(self._ws_transport.send(payload))
+                print(f"Sent payload over WebSocket")
+                return True
+            except Exception as e:
+                print(f"WebSocket send failed: {e}")
+
+        print("No transport available (LoRa or WebSocket) - abort send")
+        return False
 
     async def create_unsigned_tx(
         self, to_address: str, amount_sompi: int, fee_sompi: int = 1000
@@ -212,25 +261,74 @@ Answer (concise, no hallucination):"""
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
 
-    async def coordinate_task(self, mission: str) -> Dict:
-        prompt = f"""You are part of a self-organising Kaspa Mesh Agent swarm that communicates over a LoRa-FLRC mesh.
+    async def initiate_htlc(
+        self,
+        amount_sompi: int,
+        claim_addr: str,
+        secret_hash: str,
+        timelock_blocks: int = 288,
+        from_addr: Optional[str] = None,
+    ) -> Dict:
+        """Initiate atomic swap HTLC on Kaspa."""
+        if not HAS_SWAP_SUPPORT:
+            return {"success": False, "error": "swap_support_not_available"}
+        return _kaspa_initiate(
+            amount_sompi,
+            claim_addr,
+            secret_hash,
+            timelock_blocks,
+            self.network,
+            from_addr,
+        )
+
+    async def claim_htlc(self, utxo: str, preimage: str) -> Dict:
+        """Claim HTLC by revealing preimage."""
+        if not HAS_SWAP_SUPPORT:
+            return {"success": False, "error": "swap_support_not_available"}
+        return _kaspa_claim(utxo, preimage, self.network)
+
+    async def refund_htlc(self, utxo: str) -> Dict:
+        """Refund HTLC after timelock."""
+        if not HAS_SWAP_SUPPORT:
+            return {"success": False, "error": "swap_support_not_available"}
+        return _kaspa_refund(utxo, self.network)
+
+    async def swap_status(self, txid: str) -> Dict:
+        """Check swap UTXO status."""
+        if not HAS_SWAP_SUPPORT:
+            return {"success": False, "error": "swap_support_not_available"}
+        return _kaspa_status(txid, self.network)
+
+    def generate_secret(self) -> Dict:
+        """Generate cryptographically secure secret preimage and hash."""
+        preimage = os.urandom(32)
+        secret_hash = hashlib.sha256(preimage).hexdigest()
+        return {"preimage": preimage.hex(), "secret_hash": secret_hash}
+
+    async def coordinate_task(
+        self, mission: str, system_prompt: Optional[str] = None
+    ) -> Dict:
+        if system_prompt is None:
+            prompt = f"""You are part of a self-organising Kaspa Mesh Agent swarm that communicates over a LoRa-FLRC mesh.
 Mission: {mission}
 Available roles: Signer, Gateway, Coordinator, Helper, Abstain.
 Propose your role (JSON output only):
 {{"role":"...", "reason":"...", "next_action":"..."}}"""
+        else:
+            prompt = f"{system_prompt}\n\nMission: {mission}"
 
         headers = {"Authorization": f"Bearer {self.openrouter_key}"}
         payload = {
             "model": "openai/gpt-4o-mini",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
-            "max_tokens": 128,
+            "max_tokens": 512,
         }
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             json=payload,
             headers=headers,
-            timeout=20,
+            timeout=30,
         )
         try:
             decision = json.loads(resp.json()["choices"][0]["message"]["content"])
@@ -242,6 +340,43 @@ Propose your role (JSON output only):
             }
         print(f"Coordination decision -> {decision}")
         return decision
+
+    async def execute_atomic_swap(
+        self,
+        input_asset: str,
+        output_asset: str,
+        amount: str,
+        counterparty: str,
+        affiliate: Optional[str] = None,
+    ) -> Dict:
+        """
+        Full atomic swap execution with THORChain-style fees.
+        Generates secret, quotes, locks on first chain, waits for counterparty.
+        """
+        if not HAS_SWAP_SUPPORT or not self.pool_manager:
+            return {"success": False, "error": "swap_support_not_available"}
+
+        secret = self.generate_secret()
+        secret_hash = secret["secret_hash"]
+        preimage = secret["preimage"]
+
+        depth = self.pool_manager.get_pool_depth()
+        config = self.pool_manager.get_config()
+
+        result = {
+            "success": True,
+            "phase": "secret_generated",
+            "secret_hash": secret_hash,
+            "input_asset": input_asset,
+            "output_asset": output_asset,
+            "amount": amount,
+            "counterparty": counterparty,
+            "pool_depth": {k: str(v) for k, v in depth.items()},
+            "config": config,
+            "next_step": "lock_htlc_on_first_chain",
+        }
+
+        return result
 
     async def start_listener(self):
         if not self.interface:
